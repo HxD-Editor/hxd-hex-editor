@@ -1,0 +1,246 @@
+/* Reverse Engineer's Hex Editor
+ * Copyright (C) 2022-2026 Daniel Collins <solemnwarning@solemnwarning.net>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 as published by
+ * the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, write to the Free Software Foundation, Inc., 51
+ * Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
+
+#include "../src/platform.hpp"
+
+#include <chrono>
+#include <ostream>
+#include <random>
+#include <stdexcept>
+#include <stdio.h>
+#include <vector>
+#include <wx/app.h>
+#include <wx/frame.h>
+#include <wx/timer.h>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+#include "testutil.hpp"
+
+void run_wx_for(unsigned int ms)
+{
+	wxTimer timer;
+	
+	timer.Bind(wxEVT_TIMER, [](wxTimerEvent &event)
+	{
+		wxTheApp->ExitMainLoop();
+	});
+	
+	timer.Start(ms, wxTIMER_ONE_SHOT);
+	wxTheApp->OnRun();
+	
+	timer.Stop();
+}
+
+bool run_wx_until(const std::function<bool()> &predicate, unsigned int timeout_ms, unsigned int check_interval_ms)
+{
+	std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+	
+	std::chrono::steady_clock::time_point last_warn_at = start_time;
+	constexpr int LONG_TEST_WARNING_INTERVAL = 10;
+	
+	wxTimer timeout_timer;
+	timeout_timer.Bind(wxEVT_TIMER, [](wxTimerEvent &event)
+	{
+		wxTheApp->ExitMainLoop();
+	});
+	
+	bool predicate_returned_true = false;
+	
+	wxTimer check_timer;
+	check_timer.Bind(wxEVT_TIMER, [&](wxTimerEvent &event)
+	{
+		predicate_returned_true = predicate();
+		
+		if(predicate_returned_true)
+		{
+			wxTheApp->ExitMainLoop();
+		}
+		else{
+			std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+			
+			if((now - last_warn_at) >= std::chrono::seconds(LONG_TEST_WARNING_INTERVAL))
+			{
+				fprintf(stderr, "This operation is taking a while (time out in %u seconds)\n", (unsigned)((timeout_ms - std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count()) / 1000));
+				last_warn_at = now;
+			}
+		}
+	});
+	
+	timeout_timer.Start(timeout_ms, wxTIMER_ONE_SHOT);
+	check_timer.Start(check_interval_ms, wxTIMER_CONTINUOUS);
+	wxTheApp->OnRun();
+	
+	check_timer.Stop();
+	timeout_timer.Stop();
+	
+	return predicate_returned_true;
+}
+
+void write_file(const std::string &filename, const std::vector<unsigned char>& data)
+{
+	write_file(filename, data.data(), data.size());
+}
+
+void write_file(const std::string &filename, const void *data, size_t size)
+{
+	FILE *fh = fopen(filename.c_str(), "wb");
+	if(!fh)
+	{
+		throw std::runtime_error(std::string("Unable to open file ") + filename);
+	}
+	
+	if(size > 0)
+	{
+		if(fwrite(data, size, 1, fh) != 1)
+		{
+			fclose(fh);
+			throw std::runtime_error(std::string("Unable to write to file ") + filename);
+		}
+	}
+	
+	fclose(fh);
+}
+
+std::vector<unsigned char> read_file(const std::string &filename)
+{
+	FILE *fh = fopen(filename.c_str(), "rb");
+	if(!fh)
+	{
+		throw std::runtime_error("Unable to open file " + filename);
+	}
+	
+	std::vector<unsigned char> data;
+	
+	unsigned char buf[1024];
+	size_t len;
+	while((len = fread(buf, 1, sizeof(buf), fh)) > 0)
+	{
+		data.insert(data.end(), buf, buf + len);
+	}
+	
+	if(ferror(fh))
+	{
+		fclose(fh);
+		throw std::runtime_error("Unable to read file " + filename);
+	}
+	
+	fclose(fh);
+	
+	return data;
+}
+
+std::vector<unsigned char> data_pattern(size_t offset, size_t length)
+{
+	static std::minstd_rand rng(1234);
+	static std::vector<unsigned char> pool;
+
+	if(pool.size() < (offset + length))
+	{
+		pool.reserve(offset + length);
+
+		for(size_t i = pool.size(); i < (offset + length); ++i)
+		{
+			pool.push_back(rng() & 0xFF);
+		}
+	}
+
+	return std::vector<unsigned char>(std::next(pool.begin(), offset), std::next(pool.begin(), (offset + length)));
+}
+
+TempFilename::TempFilename()
+{
+	if(tmpnam(tmpfile) == NULL)
+	{
+		throw std::runtime_error("Cannot generate temporary file name");
+	}
+	
+#ifdef _WIN32
+	/* > Note than when a file name is pre-pended with a backslash and no path
+	 * > information, such as \fname21, this indicates that the name is valid
+	 * > for the current working directory.
+	 * - MSDN
+	 *
+	 * Sure, that makes total sense.
+	*/
+	if(tmpfile[0] == '\\' && strchr((tmpfile + 1), '\\') == NULL)
+	{
+		/* Remove the leading slash. */
+		memmove(tmpfile, tmpfile + 1, strlen(tmpfile) - 1);
+	}
+#endif
+}
+
+TempFilename::~TempFilename()
+{
+	unlink(tmpfile);
+}
+
+TempFile::TempFile(const void *initial_data, size_t size)
+{
+	write_file(tmpfile, initial_data, size);
+}
+
+TempFile::TempFile(const std::string &initial_data)
+{
+	write_file(tmpfile, initial_data.data(), initial_data.size());
+}
+
+AutoJSON::AutoJSON():
+	json(NULL) {}
+
+AutoJSON::AutoJSON(json_t *json_obj):
+	json(json_obj) {}
+
+AutoJSON::AutoJSON(const char *json_text)
+{
+	json_error_t err;
+	json = json_loads(json_text, 0, &err);
+	
+	if(json == NULL)
+	{
+		throw std::runtime_error(err.text);
+	}
+}
+
+AutoJSON::~AutoJSON()
+{
+	json_decref(json);
+}
+
+std::string AutoJSON::serialise() const
+{
+	std::vector<char> buf(json_dumpb(json, NULL, 0, JSON_INDENT(4) | JSON_SORT_KEYS));
+	json_dumpb(json, buf.data(), buf.size(), JSON_INDENT(4) | JSON_SORT_KEYS);
+	
+	return std::string(buf.data(), buf.size());
+}
+
+bool AutoJSON::operator==(const AutoJSON &rhs) const
+{
+	return (json == NULL && rhs.json == NULL)
+		|| json_equal(json, rhs.json);
+}
+
+std::ostream& operator<<(std::ostream& os, const AutoJSON &json)
+{
+	return os << json.serialise();
+}
