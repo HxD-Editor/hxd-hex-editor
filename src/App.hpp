@@ -1,0 +1,272 @@
+/* Reverse Engineer's Hex Editor
+ * Copyright (C) 2017-2026 Daniel Collins <solemnwarning@solemnwarning.net>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 as published by
+ * the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, write to the Free Software Foundation, Inc., 51
+ * Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
+
+#ifndef REHEX_APP_HPP
+#define REHEX_APP_HPP
+
+#include "AppSettings.hpp"
+#include "ConsoleBuffer.hpp"
+#include "IPC.hpp"
+#include "MacFileHistory.hpp"
+#include "mainwindow.hpp"
+#include "ThreadPool.hpp"
+
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
+#include <wx/config.h>
+#include <wx/filename.h>
+#include <wx/filehistory.h>
+#include <wx/help.h>
+#include <wx/intl.h>
+#include <wx/wx.h>
+
+namespace REHex {
+	#ifdef BUILD_HELP
+	#ifdef _WIN32
+	typedef wxCHMHelpController HelpController;
+	#else
+	typedef wxHtmlHelpController HelpController;
+	#endif
+	#endif
+	
+	class App: public wxApp
+	{
+		public:
+			App();
+			
+			wxConfig *config;
+			AppSettings *settings;
+			
+			#ifdef __APPLE__
+			MacFileHistory *recent_files;
+			#else
+			wxFileHistory *recent_files;
+			#endif
+
+			wxLocale *locale;
+			
+			ConsoleBuffer *console;
+			ThreadPool *thread_pool;
+			
+			/**
+			 * @brief Get the last directory browsed to in a load/save dialog.
+			*/
+			const std::string &get_last_directory();
+			
+			/**
+			 * @brief Set the last directory browsed to in a load/save dialog.
+			*/
+			void set_last_directory(const std::string &last_directory);
+			
+			/**
+			 * @brief Get a list of directories to search for plugins.
+			*/
+			std::vector<std::string> get_plugin_directories();
+			
+			/**
+			 * @brief Print a debug message to the application console.
+			*/
+			void print_debug(const std::string &text);
+			
+			/**
+			 * @brief Print a printf format debug message to the application console.
+			*/
+			void printf_debug(const char *fmt, ...);
+			
+			/**
+			 * @brief Print a message to the application console.
+			*/
+			void print_info(const std::string &text);
+			
+			/**
+			 * @brief Print a printf format message to the application console.
+			*/
+			void printf_info(const char *fmt, ...);
+			
+			/**
+			 * @brief Print an error message to the application console.
+			*/
+			void print_error(const std::string &text);
+			
+			/**
+			 * @brief Print a printf format error message to the application console.
+			*/
+			void printf_error(const char *fmt, ...);
+			
+			/**
+			 * @brief App setup phases, in order of execution.
+			*/
+			enum class SetupPhase
+			{
+				EARLY,  /**< About to begin App OnInit() method. */
+				READY,  /**< Global state initialised - about to construct initial MainWindow. */
+				DONE,   /**< About to return from OnInit() method. */
+				
+				SHUTDOWN,       /**< About to start App OnExit() method. */
+				SHUTDOWN_LATE,  /**< Called near end of OnExit(), symmetric with EARLY. */
+			};
+			
+			typedef std::function<void()> SetupHookFunction;
+			
+			/**
+			 * @brief Register a hook function to be called during a setup phase.
+			 *
+			 * @param phase  Setup phase to call the hook during.
+			 * @param func   Pointer to a std::function to invoke.
+			 *
+			 * You should probably use SetupHookRegistration rather than calling this
+			 * function directly.
+			 *
+			 * NOTE: The std::function pointed to by func MUST remain valid until
+			 * unregister_setup_hook() is used - it will be used to call the function
+			 * and identifies the unique binding until is is unregistered.
+			*/
+			static void register_setup_hook(SetupPhase phase, const SetupHookFunction *func);
+			
+			/**
+			 * @brief Unregister a setup hook.
+			*/
+			static void unregister_setup_hook(SetupPhase phase, const SetupHookFunction *func);
+			
+			/**
+			 * @brief Performs RAII-style App setup hook registration.
+			*/
+			class SetupHookRegistration
+			{
+				public:
+					SetupPhase phase;        /**< @brief App setup phase to call function during. */
+					SetupHookFunction func;  /**< @brief Hook function to be called. */
+					
+					/**
+					 * @brief Register the setup hook.
+					 *
+					 * @param phase  App setup phase to call function during.
+					 * @param func   Hook function to be called.
+					*/
+					SetupHookRegistration(SetupPhase phase, const SetupHookFunction &func);
+					
+					/**
+					 * @brief Unregister the setup hook.
+					*/
+					~SetupHookRegistration();
+					
+					SetupHookRegistration(const SetupHookRegistration &src) = delete;
+					SetupHookRegistration &operator=(const SetupHookRegistration &rhs) = delete;
+			};
+			
+			int get_caret_on_time_ms();
+			int get_caret_off_time_ms();
+			
+			#ifdef BUILD_HELP
+			HelpController *get_help_controller(wxWindow *error_parent);
+
+			/**
+			 * @brief Display the contents page from the manual in the help viewer.
+			 *
+			 * @param error_parent  Window to parent (modal) error dialog to if there is an error.
+			*/
+			void show_help_contents(wxWindow *error_parent);
+
+			/**
+			 * @brief Display a page from the manual in the help viewer.
+			 *
+			 * @param error_parent  Window to parent (modal) error dialog to if there is an error.
+			 * @param page_name     Filename of page, without path or file extension.
+			*/
+			void show_help_page(wxWindow *error_parent, const std::string &page_name);
+			#endif
+			
+			virtual bool Initialize(int& argc, wxChar **argv) override;
+			virtual bool OnInit() override;
+			virtual int OnExit() override;
+			virtual int OnRun() override;
+			
+			#ifdef __WXOSX__
+			virtual void MacOpenFiles(const wxArrayString &fileNames) override;
+			#endif
+			
+			int bulk_updates_freeze_count;
+			
+			void bulk_updates_freeze();
+			void bulk_updates_thaw();
+			bool bulk_updates_frozen();
+			
+			#ifdef __APPLE__
+			/**
+			 * @brief Wrapper around the NSHomeDirectory() function.
+			 *
+			 * This function returns the application sandbox directory, or the user's
+			 * home directory if not sandboxed.
+			*/
+			static std::string get_home_directory();
+			#endif
+			
+			#ifdef REHEX_ENABLE_WAYLAND_HACKS
+			/**
+			 * @brief Check if the application is running under Wayland.
+			*/
+			static bool is_wayland_session();
+			#endif
+
+			/**
+			 * @brief Get the directory where application state data should be stored.
+			*/
+			static std::string get_state_directory();
+
+			/**
+			 * @brief Get the path to the workspace that will be restored at startup.
+			*/
+			static wxFileName get_auto_workspace();
+
+			/**
+			 * @brief Load a workspace and restore all windows within.
+			 *
+			 * @return true if the workspace file was loaded successfully.
+			*/
+			bool load_workspace(const wxFileName &filename);
+			
+		private:
+			std::string last_directory;
+			
+			MainWindow *window;
+			
+			#ifdef BUILD_HELP
+			HelpController *help_controller;
+			bool help_loaded;
+			#endif
+			
+			static std::multimap<SetupPhase, const SetupHookFunction*> *setup_hooks;
+			void call_setup_hooks(SetupPhase phase);
+			
+			void OnTabDropped(DetachedPageEvent &event);
+			void OnEndSession(wxCloseEvent &event);
+			
+			IPCServer *ipc_server;
+			
+			bool quick_exit;
+			int quick_exit_code;
+			
+		public:
+			void _test_setup_hooks(SetupPhase phase);
+	};
+}
+
+DECLARE_APP(REHex::App);
+
+#endif /* !REHEX_APP_HPP */

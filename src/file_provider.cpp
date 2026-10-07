@@ -1,0 +1,515 @@
+#include "content/providers/file_provider.hpp"
+#include "content/providers/memory_file_provider.hpp"
+
+#include <hex/api/content_registry/settings.hpp>
+#include <hex/api/localization_manager.hpp>
+#include <hex/api/project_manager.hpp>
+#include <hex/api/events/requests_gui.hpp>
+#include <hex/api/events/events_interaction.hpp>
+
+#include <banners/banner_button.hpp>
+#include <toasts/toast_notification.hpp>
+
+#include <hex/helpers/utils.hpp>
+#include <hex/helpers/fmt.hpp>
+#include <fmt/chrono.h>
+
+#include <wolv/utils/string.hpp>
+#include <wolv/literals.hpp>
+
+#include <nlohmann/json.hpp>
+#include <cstring>
+
+#if defined(OS_WINDOWS)
+    #include <windows.h>
+#elif defined(OS_FREEBSD)
+    #include <sys/extattr.h>
+#elif defined(OS_MACOS) || defined(OS_LINUX)
+    #include <sys/xattr.h>
+#endif
+
+namespace hex::plugin::builtin {
+
+    using namespace wolv::literals;
+
+    bool FileProvider::isAvailable() const {
+        return true;
+    }
+
+    bool FileProvider::isReadable() const {
+        return isAvailable() && m_readable;
+    }
+
+    bool FileProvider::isWritable() const {
+        return isAvailable() && m_writable;
+    }
+
+    bool FileProvider::isResizable() const {
+        return isAvailable() && isWritable();
+    }
+
+    bool FileProvider::isSavable() const {
+        return m_loadedIntoMemory;
+    }
+
+    void FileProvider::readRaw(u64 offset, void *buffer, size_t size) {
+        if (m_fileSize == 0 || (offset + size) > m_fileSize || buffer == nullptr || size == 0)
+            return;
+
+        if (m_loadedIntoMemory)
+            std::memcpy(buffer, m_data.data() + offset, size);
+        else
+            m_file.readBufferAtomic(offset, static_cast<u8*>(buffer), size);
+    }
+
+    void FileProvider::writeRaw(u64 offset, const void *buffer, size_t size) {
+        if ((offset + size) > this->getActualSize() || buffer == nullptr || size == 0)
+            return;
+
+        if (m_loadedIntoMemory) {
+            std::memcpy(m_data.data() + offset, buffer, size);
+        } else {
+            this->createBackupIfNeeded(m_file.getPath());
+            if (m_file.writeBufferAtomic(offset, static_cast<const u8*>(buffer), size) != static_cast<i64>(size))
+                m_writeFailed = true;
+        }
+    }
+
+    void FileProvider::save() {
+        bool result = true;
+        if (m_loadedIntoMemory) {
+            m_ignoreNextChangeEvent = true;
+            this->createBackupIfNeeded(m_file.getPath());
+            m_file.open();
+            result = m_file.isValid() &&
+                m_file.writeVectorAtomic(0x00, m_data) == static_cast<i64>(m_data.size());
+            if (result)
+                result = m_file.setSize(m_data.size());
+            if (result)
+                result = m_file.flush();
+        } else {
+            result = !m_writeFailed && m_file.flush();
+        }
+
+        #if defined(OS_WINDOWS)
+            FILETIME ft;
+            SYSTEMTIME st;
+
+            if (m_file.isValid()) {
+                GetSystemTime(&st);
+                if (SystemTimeToFileTime(&st, &ft)) {
+                    auto fileHandle = HANDLE(_get_osfhandle(_fileno(m_file.getHandle())));
+                    SetFileTime(fileHandle, nullptr, nullptr, &ft);
+                }
+            }
+        #endif
+
+        if (m_loadedIntoMemory)
+            m_file.close();
+
+        if (result) {
+            m_writeFailed = false;
+            Provider::save();
+        }
+    }
+
+    void FileProvider::saveAs(const std::fs::path &path) {
+        if (path == getPickedPath())
+            this->save();
+        else
+            Provider::saveAs(path);
+    }
+
+    void FileProvider::resizeRaw(u64 newSize) {
+        if (m_loadedIntoMemory) {
+            m_data.resize(newSize);
+        } else {
+            this->createBackupIfNeeded(m_file.getPath());
+            if (!m_file.setSize(newSize))
+                m_writeFailed = true;
+        }
+
+        m_fileSize = newSize;
+    }
+
+    u64 FileProvider::getActualSize() const {
+        return m_fileSize;
+    }
+
+    std::string FileProvider::getName() const {
+        return wolv::util::toUTF8String(getPickedPath().filename());
+    }
+
+    std::vector<FileProvider::Description> FileProvider::getDataDescription() const {
+        std::vector<Description> result;
+
+        result.emplace_back("hex.builtin.provider.file.path"_lang, wolv::util::toUTF8String(getPickedPath()));
+        result.emplace_back("hex.builtin.provider.file.size"_lang, hex::toByteString(this->getActualSize()));
+
+        if (m_fileStats.has_value()) {
+            std::string creationTime, accessTime, modificationTime;
+
+            try { creationTime = fmt::format("{:%Y-%m-%d %H:%M:%S}", *std::localtime(&m_fileStats->st_ctime)); }
+            catch (const fmt::format_error&) { creationTime = "???"; }
+
+            try { accessTime = fmt::format("{:%Y-%m-%d %H:%M:%S}", *std::localtime(&m_fileStats->st_atime)); }
+            catch (const fmt::format_error&) { accessTime = "???"; }
+
+            try { modificationTime = fmt::format("{:%Y-%m-%d %H:%M:%S}", *std::localtime(&m_fileStats->st_mtime)); }
+            catch (const fmt::format_error&) { modificationTime = "???"; }
+
+            result.emplace_back("hex.builtin.provider.file.creation"_lang,      creationTime);
+            result.emplace_back("hex.builtin.provider.file.access"_lang,        accessTime);
+            result.emplace_back("hex.builtin.provider.file.modification"_lang,  modificationTime);
+        }
+
+        #if defined(OS_MACOS) || defined(OS_LINUX)
+
+            constexpr static auto getxattrs = [](const char *path, char *list, size_t size) -> ssize_t {
+                #if defined(OS_LINUX)
+                    return ::listxattr(path, list, size);
+                #elif defined(OS_MACOS)
+                    return ::listxattr(path, list, size, 0);
+                #endif
+            };
+
+            {
+                const auto &path = getPickedPath();
+                auto xattrSize = getxattrs(path.c_str(), nullptr, 0);
+                if (xattrSize > 0) {
+                    std::string xattrList(xattrSize, 0x00);
+                    getxattrs(path.c_str(), xattrList.data(), xattrSize);
+
+                    std::string formattedXattrs;
+                    for (const auto &xattr : wolv::util::splitString(xattrList, std::string(1, 0x00))) {
+                        if (!xattr.empty())
+                            formattedXattrs += fmt::format("- {}\n", xattr);
+                    }
+
+                    result.emplace_back("hex.builtin.provider.file.xatts"_lang,  formattedXattrs);
+                }
+            }
+
+        #endif
+
+        return result;
+    }
+
+    std::vector<fs::ItemFilter> FileProvider::getValidExtensions() const {
+        return {};
+    }
+
+    std::variant<std::string, i128> FileProvider::queryInformation(const std::string &category, const std::string &argument) {
+        const auto &path = getPickedPath();
+        if (category == "file_path")
+            return wolv::io::fs::toNormalizedPathString(path);
+        else if (category == "file_name")
+            return wolv::io::fs::toNormalizedPathString(path.filename());
+        else if (category == "file_extension")
+            return wolv::io::fs::toNormalizedPathString(path.extension());
+        else if (category == "creation_time")
+            return m_fileStats->st_ctime;
+        else if (category == "access_time")
+            return m_fileStats->st_atime;
+        else if (category == "modification_time")
+            return m_fileStats->st_mtime;
+        else if (category == "permissions")
+            return m_fileStats->st_mode & 0777U;
+        else
+            return Provider::queryInformation(category, argument);
+    }
+
+    std::vector<FileProvider::MenuEntry> FileProvider::getMenuEntries() {
+        MenuEntry loadMenuItem;
+
+        if (m_loadedIntoMemory) {
+            loadMenuItem = {
+                .name = "hex.builtin.provider.file.menu.direct_access"_unlocalized,
+                .icon = ICON_VS_ARROW_SWAP,
+                .callback = [this] {
+                    this->convertToDirectAccess();
+                },
+            };
+        } else {
+            loadMenuItem = {
+                .name = "hex.builtin.provider.file.menu.into_memory"_unlocalized,
+                .icon = ICON_VS_ARROW_SWAP,
+                .callback = [this] {
+                    this->convertToMemoryFile();
+                },
+            };
+        }
+
+        return {
+            {
+                .name = "hex.builtin.provider.file.menu.open_folder"_unlocalized,
+                .icon = ICON_VS_FOLDER_OPENED,
+                .callback = [this] {
+                    fs::openFolderWithSelectionExternal(getPickedPath());
+                },
+            },
+            {
+                .name = "hex.builtin.provider.file.menu.open_file"_unlocalized,
+                .icon = ICON_VS_FILE,
+                .callback = [this] {
+                    fs::openFileExternal(getPickedPath());
+                },
+            },
+            loadMenuItem,
+        };
+    }
+
+    prv::Provider::OpenResult FileProvider::open() {
+        const auto maxMemoryFileSize = ContentRegistry::Settings::read<u64>("hex.builtin.setting.general"_unlocalized, "hex.builtin.setting.general.max_mem_file_size"_unlocalized, 128_MiB);
+
+        const auto &path = getPickedPath();
+
+        size_t fileSize = 0x00;
+        {
+            wolv::io::File file(path, wolv::io::File::Mode::Read);
+            if (!file.isValid()) {
+                return OpenResult::failure(fmt::format("hex.builtin.provider.file.error.open"_lang, path.string(), formatSystemError(file.getOpenError().value_or(0))));
+            }
+
+            fileSize = file.getSize();
+        }
+
+        const bool directAccess = fileSize >= maxMemoryFileSize;
+        const auto result = open(directAccess);
+
+        if (result.isSuccess()) {
+            this->lockFile(getPickedPath());
+
+            if (directAccess) {
+                m_writable = false;
+
+                ui::BannerButtonProviderSpecific::open(this, ICON_VS_WARNING, "hex.builtin.provider.file.too_large"_unlocalized, ImColor(135, 116, 66), "hex.builtin.provider.file.too_large.allow_write"_unlocalized, [this]{
+                    m_writable = true;
+                    RequestUpdateWindowTitle::post();
+                });
+            }
+        }
+
+        return result;
+    }
+
+    prv::Provider::OpenResult FileProvider::open(bool directAccess) {
+        m_readable = true;
+        m_writable = true;
+
+        const auto &path = getPickedPath();
+        if (wolv::io::fs::isDirectory(path))
+            return OpenResult::failure(fmt::format("hex.builtin.provider.file.error.is_directory"_lang, path.string()));
+
+        wolv::io::File file(path, wolv::io::File::Mode::Write);
+        if (!file.isValid()) {
+            m_writable = false;
+
+            file = wolv::io::File(path, wolv::io::File::Mode::Read);
+            if (!file.isValid()) {
+                m_readable = false;
+                return OpenResult::failure(fmt::format("hex.builtin.provider.file.error.open"_lang, path.string(), formatSystemError(file.getOpenError().value_or(0))));
+            }
+
+            ui::ToastInfo::open("hex.builtin.popup.error.read_only"_lang);
+        }
+
+        m_file      = std::move(file);
+        m_fileStats = m_file.getFileInfo();
+        m_fileSize  = m_file.getSize();
+
+        // Make sure the current file is not already opened
+        if (auto provider = isFileLocked(path); provider != nullptr) {
+            return OpenResult::redirect(provider);
+        }
+
+        if (m_writable) {
+            if (directAccess) {
+                m_loadedIntoMemory = false;
+            } else {
+                if (m_fileSize == 0) {
+                    while (true) {
+                        constexpr static i64 ChunkSize = 1_MiB;
+                        auto startSize = m_data.size();
+                        m_data.resize(startSize + ChunkSize);
+                        auto result = m_file.readBuffer(m_data.data() + startSize, ChunkSize);
+                        if (result <= 0) {
+                            m_data.resize(startSize);
+                            break;
+                        } else if (result < ChunkSize) {
+                            m_data.resize(startSize + result);
+                            break;
+                        }
+                    }
+
+                    m_fileSize = m_data.size();
+                    m_loadedIntoMemory = true;
+                } else {
+                    m_data = m_file.readVectorAtomic(0x00, m_fileSize);
+                    if (!m_data.empty()) {
+                        m_changeTracker = wolv::io::ChangeTracker(m_file);
+                        m_changeTracker.startTracking([this]{ this->handleFileChange(); });
+                        m_loadedIntoMemory = true;
+                    }
+                }
+            }
+        }
+
+        if (m_loadedIntoMemory)
+            m_file.close();
+
+        m_changeEventAcknowledgementPending = false;
+        m_writeFailed = false;
+        m_ignoreNextChangeEvent = false;
+
+        return {};
+    }
+
+
+    void FileProvider::close() {
+        m_file.close();
+        m_data.clear();
+        m_changeTracker.stopTracking();
+        m_readable = false;
+        m_writable = false;
+    }
+
+    bool FileProvider::relocateFile(const std::fs::path &path) {
+        if (path == getPickedPath())
+            return true;
+
+        if (auto *provider = isFileLocked(path); provider != nullptr && provider != this)
+            return false;
+
+        const bool wasWritable = m_writable;
+        bool writable = true;
+        wolv::io::File file(path, wolv::io::File::Mode::Write);
+        if (!file.isValid()) {
+            writable = false;
+            file = wolv::io::File(path, wolv::io::File::Mode::Read);
+            if (!file.isValid())
+                return false;
+        }
+
+        m_changeTracker.stopTracking();
+        m_file.close();
+        this->setPickedPath(path);
+        m_file = std::move(file);
+        m_fileStats = m_file.getFileInfo();
+        m_readable = true;
+        m_writable = writable && wasWritable;
+        this->lockFile(path);
+
+        if (m_loadedIntoMemory) {
+            m_changeTracker = wolv::io::ChangeTracker(m_file);
+            m_changeTracker.startTracking([this]{ this->handleFileChange(); });
+            m_file.close();
+        } else {
+            m_fileSize = m_file.getSize();
+        }
+
+        return true;
+    }
+
+    bool FileProvider::flushFile() {
+        if (!m_loadedIntoMemory)
+            return !m_writeFailed && m_file.flush();
+
+        m_ignoreNextChangeEvent = true;
+        m_file.open();
+        bool result = m_file.isValid() &&
+            m_file.writeVectorAtomic(0x00, m_data) == static_cast<i64>(m_data.size());
+        if (result)
+            result = m_file.setSize(m_data.size());
+        if (result)
+            result = m_file.flush();
+        m_file.close();
+        return result;
+    }
+
+    void FileProvider::loadSettings(const nlohmann::json &settings) {
+        Provider::loadSettings(settings);
+
+        auto pathString = settings.at("path").get<std::string>();
+        std::fs::path path = std::u8string(pathString.begin(), pathString.end());
+
+        if (auto projectPath = ProjectManager::getProjectRoot(); !projectPath.empty()) {
+            std::fs::path fullPath;
+            try {
+                fullPath = std::fs::weakly_canonical(projectPath / path);
+            } catch (const std::fs::filesystem_error &) {
+                fullPath = projectPath / path;
+            }
+
+            if (!wolv::io::fs::exists(fullPath))
+                fullPath = path;
+
+            path = std::move(fullPath);
+        }
+
+        this->setPickedPath(path);
+    }
+
+    nlohmann::json FileProvider::storeSettings(nlohmann::json settings) const {
+        const auto &pickedPath = getPickedPath();
+
+        std::fs::path path;
+        if (pickedPath.u8string().starts_with(u8"//")) {
+            path = pickedPath;
+        } else {
+            if (auto projectPath = ProjectManager::getProjectRoot(); !projectPath.empty())
+                path = std::fs::proximate(pickedPath, projectPath);
+            if (path.empty())
+                path = pickedPath;
+        }
+
+        settings["path"] = wolv::io::fs::toNormalizedPathString(path);
+
+        return Provider::storeSettings(settings);
+    }
+
+    std::pair<Region, bool> FileProvider::getRegionValidity(u64 address) const {
+        address -= this->getBaseAddress();
+
+        if (address < this->getActualSize())
+            return { Region { .address=this->getBaseAddress() + address, .size=this->getActualSize() - address }, true };
+        else
+            return { Region::Invalid(), false };
+    }
+
+    void FileProvider::convertToMemoryFile() {
+        this->close();
+        this->unlockFile(getPickedPath());
+        this->open(false);
+    }
+
+    void FileProvider::convertToDirectAccess() {
+        this->close();
+        this->unlockFile(getPickedPath());
+        this->open(true);
+    }
+
+    void FileProvider::handleFileChange() {
+        if (m_ignoreNextChangeEvent) {
+            m_ignoreNextChangeEvent = false;
+            return;
+        }
+
+        if (m_changeEventAcknowledgementPending) {
+            return;
+        }
+
+        m_changeEventAcknowledgementPending = true;
+        ui::BannerButtonProviderSpecific::open(this, ICON_VS_INFO, "hex.builtin.provider.file.reload_changes"_unlocalized, ImColor(66, 104, 135), "hex.builtin.provider.file.reload_changes.reload"_unlocalized, [this] {
+            this->close();
+            (void)this->open(!m_loadedIntoMemory);
+
+            getUndoStack().reapply();
+            EventDataChanged::post(this);
+        },[this] {
+            m_changeEventAcknowledgementPending = false;
+        });
+    }
+
+
+}
